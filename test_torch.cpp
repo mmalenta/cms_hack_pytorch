@@ -1,36 +1,28 @@
-#include <algorithm>
-#include <random>
-
-#include <cuda_runtime_api.h>
-#include <cuda.h>
-
-#include <nvToolsExt.h>
-// Including that causes double free corruption error
-//#include <thrust/device_vector.h>
-#include <torch/script.h> // One-stop header.
-
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 
+#include <nvToolsExt.h>
+#include <torch/script.h> // One-stop header.
+
+#include "H5Cpp.h"
+
+using namespace H5;
+
 #define NUM_INFERENCE 32 
-
-
-#define cudaCheckError(myerror) {checkGPU((myerror), __FILE__, __LINE__);}
-
-inline void checkGPU(cudaError_t code, const char *file, int line) {
-
-    if (code != cudaSuccess) {
-        std::cout << "CUDA error: " << cudaGetErrorString(code) << " in file " << file << ", line " << line << std::endl;
-        exit(EXIT_FAILURE);
-    }
-
-}
+#define IMAGE_DIMS 3
+#define CHANNELS 8
+#define HEIGHT 125
+#define WIDTH 125 
+#define IMAGE_SIZE CHANNELS * HEIGHT * WIDTH
 
 int main(int argc, const char* argv[]) {
-  if (argc != 2) {
-    std::cerr << "usage: example-app <path-to-exported-script-module>\n";
+  if (argc != 4) {
+    std::cerr << "usage: example-app <path-to-exported-script-module> <path-to-hdf5-file> <batch-size>\n";
     return -1;
   }
+
+  int batch_size = std::atoi(argv[3]);
 
   nvtxRangePushA("Model load");
   torch::jit::script::Module module;
@@ -46,65 +38,85 @@ int main(int argc, const char* argv[]) {
   nvtxRangePop();
   std::cout << "ok\n";
 
-  auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, 0);
+  try {
+    std::cout << argv[2] << "\n";
+    H5File h5file = H5File(argv[2], H5F_ACC_RDONLY);
+    DataSet dataset = h5file.openDataSet("X_jets");
 
-  // 1's for testing
-  float *array = new float[1 * 3 * 224 * 224];
-  std::fill_n(array, 1 * 3 * 224 * 224, 1.0f);
+    std::cout << "File " << argv[2] << " read OK..\n";
+    H5T_class_t type_class = dataset.getTypeClass();
 
-  // Random numbers
-  std::default_random_engine engine;
-  std::uniform_real_distribution<float> dist(0.0f,255.0f);
+    FloatType intype = dataset.getFloatType();
+    size_t insize = intype.getSize();
+    if (type_class == H5T_FLOAT) {
+      std::cout << "Data is in FLOAT format, with " << insize << "B per sample\n";
+    }
 
-  float *input_d;
-  cudaCheckError(cudaMalloc((void**)&input_d, 1 * 3 * 224 * 224 * sizeof(float)));
-  //cudaCheckError(cudaFree(input_d));
+    DataSpace dataspace = dataset.getSpace();
+    int rank = dataspace.getSimpleExtentNdims();
+    std::cout << "Number of dimensions: " << rank << "\n";
+
+    hsize_t *dims = new hsize_t[rank];
+    int ndims = dataspace.getSimpleExtentDims(dims, NULL);
+
+    std::cout << "Dimension sizes: \n";
+    for (int idim = 0; idim < rank; ++idim) {
+      std::cout << "\t" << idim << ": " << dims[idim] << "\n";
+    }
   
-  for (int iinf = 0; iinf < NUM_INFERENCE; ++iinf) {
-  
-    nvtxRangePushA("Generating random numbers on host");
-    std::vector<float> input(1 * 3 * 224 * 224);
-    std::generate(input.begin(), input.end(), [&dist, &engine]() { return dist(engine); });
-    std::generate(input.begin(), input.end(), [&dist, &engine]() { return 1.0f; });
-    //cudaMemcpy(input_d, &input[0], 1 * 3 * 224 * 224 * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(input_d, array, 1 * 3 * 224 * 224 * sizeof(float), cudaMemcpyHostToDevice);
-    //thrust::device_vector<float> input_d = input;
-    nvtxRangePop();
+  for (int iinf = 0; iinf < int(NUM_INFERENCE / batch_size); ++iinf) {
 
+    std::cout << "Running on image " << iinf << std::endl;
+
+    // Prepare the HDF5 file for reading
+    hsize_t offset[2];
+    offset[0] = iinf * batch_size;
+    offset[1] = 0;
+    hsize_t count[2];
+    count[0] = batch_size;
+    count[1] = IMAGE_SIZE;
+    dataspace.selectHyperslab(H5S_SELECT_SET, count, offset);
+    
+    // Prepeare the memory to put the data in
+    double *image_data = new double[IMAGE_SIZE * batch_size];
+    hsize_t image_dims[2];
+    image_dims[0] = batch_size;
+    image_dims[1] = IMAGE_SIZE;
+    DataSpace image_space(2, image_dims);
+    hsize_t m_offset[2];
+    m_offset[0] = 0;
+    m_offset[1] = 0;
+    hsize_t m_count[2];
+    m_count[0] = batch_size;
+    m_count[1] = IMAGE_SIZE;
+    image_space.selectHyperslab(H5S_SELECT_SET, m_count, m_offset);
+    dataset.read(image_data, PredType::NATIVE_DOUBLE, image_space, dataspace);
+   
     nvtxRangePushA("Loading input");
     std::vector<torch::jit::IValue> inputs;
-    //torch::Tensor tensor = torch::ones({1, 3, 224, 224}).to(torch::kCUDA);
-    // That doesn't work
-    //torch::Tensor tensor = torch::from_blob(array, {1, 3, 224, 224}, options).clone();
-    
-    // That uses a standard C++ array as a data source to the tensor
-    // This array is filled with 1's
-    //torch::Tensor tensor = torch::from_blob(array, {1, 3, 224, 224});
-    
-    // This uses a standard C++ vector as a data source to the tensor
-    // This tensor is filled with random numbers
-    //torch::Tensor tensor = torch::from_blob(input.data(), {1, 3, 224, 224}).clone();
-    // Both above cases need the conversion to the device
-    //inputs.push_back(tensor.to(torch::kCUDA));
- 
-    // This weirdly works even with the above double free corruption error   
-    // This uses a Thrust device vector as a data source to the tensor
-    torch::Tensor tensor = torch::from_blob(input_d, {1, 3, 224, 224}, options).clone();
-    // Already on device
-    inputs.push_back(tensor);
-    nvtxRangePop();
+   
+    // Read the data into the tensor - still in F64 format 
+    torch::Tensor init_tensor = torch::from_blob(image_data, {batch_size, IMAGE_SIZE}, torch::dtype(torch::kFloat64));
+    // Convert the data into F32 format
+    torch::Tensor tensor = init_tensor.to(torch::kFloat32);
+    // Push the data to the device
+    inputs.push_back(tensor.to(torch::kCUDA));
+    nvtxRangePop(); // Loading input
 
     // Execute the model and turn its output into a tensor.
     nvtxRangePushA("Model execution");
-    //at::Tensor output = module.forward(inputs).toTensor();
     at::Tensor output = module.forward(inputs).toTensor();
-    nvtxRangePop();
-    std::cout << output.slice(1, 0, 5) << '\n';
-
-    //cudaFree(input_d);
+    nvtxRangePop(); // Model execution
+    std::cout << output << "\n\n";
+    
+    delete [] image_data;
   }
   
-  delete [] array;
+  } catch (FileIException error) {
+    std::cerr << "Problem reading HDF5 file " << std::endl;
+    error.printError();
+    return -1;
+  }
 }
 
 
